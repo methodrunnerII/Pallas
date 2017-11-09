@@ -1,0 +1,3219 @@
+/*******************************************************************************
+*         McXtrace instrument definition URL=http://www.mcxtrace.org
+*
+* Instrument: AthenaSynthesisStray
+*
+* %Identification
+* Written by: Arne 'S Jegers
+* Date:
+* Origin: DTU Space
+* Release: McXtrace (version)
+* Version: 1
+* %INSTRUMENT_SITE: ESA
+*
+* Athena Silicon Pore Optics simulation
+*
+* %Description
+* Single parabolic-hyperbolic pore pair of Athena's SPO optics array. The pore pair can be set to correspond to the middle pores of any of the 1062 mirror modules. The monitor at the focal plane outputs a data file. See the FINALLY section for the specifications of this file.
+*
+* %Parameters
+*
+* %Link
+* A reference/HTML link for more information
+*
+* %End
+*******************************************************************************/
+
+DEFINE INSTRUMENT AthenaModule(
+    int module_nr = 0,
+    int plate_nr = 0,
+    int energy = 1,
+    int source_type = 0,
+    double source_th = 0,
+    double source_dx = 0,
+    double source_dy = 0,
+    int absorb_sides = 1,
+    int absorb_bottom = 1,
+    char* output_filename = "")
+
+/* The DECLARE section allows us to declare variables or  small      */
+/* functions in C syntax. These may be used in the whole instrument. */
+DECLARE
+%{
+    int min(int x, int y){
+      if(x > y){
+        return y;
+      }
+      return x;
+    }
+
+    #define TWOPI 6.283185307
+    #define DEGTORAD 0.017453293
+
+    #define FOCALLENGTH 12
+
+    #define PLATE_THICKNESS 0.00017
+    #define PORE_PITCH_DEFAULT 0.001
+    #define PLATE_PITCH_DEFAULT 0.000775
+    #define PORE_HEIGHT_DEFAULT 0.000605
+    #define PORE_WIDTH_DEFAULT 0.00083
+    #define MODULE_HEIGHT_DEFAULT 0.053645
+    #define CHAMFERWIDTH 0
+
+    #include "geom.c"
+    #include "dataOutput.c"
+    #include <unistd.h>
+
+    // Pore parameters
+    #define MAXPORES 93
+    double poreX[MAXPORES];
+    double poreY[MAXPORES];
+    double poreAngle[MAXPORES];
+    double poreAngleDegrees[MAXPORES];
+    double poreW;
+    double poreH;
+    double porePitch;
+
+    double radiusP;
+    double radiusH;
+    double radiusM;
+
+    double moduleAngle;
+    int poresPerPlate;
+
+    double parabolaDeviation;
+    double hyperbolaDeviation;
+
+    // MISC STUFF
+    double sourceToOptics = 1;
+    double focalLength = 12;
+
+    double majorRadius = 1.5;
+
+    double dEnergy = 0.00001;     //KeV
+
+    int finalResolution = 1024;
+    double detectorSize = 0.13312;
+
+    int wideResolution = 255;
+    double wideSize = 3;  //Edge size in meters of wide monitor
+
+    double thX, thY, thZ;
+    double srcW;
+    double srcH;
+
+    //Counters
+    long photonCount;
+    long photonPassedThrough;
+    double photonPassedThroughWeighted;
+
+    char* coating;
+    char* coatingSide;
+    char* coatingBottom;
+
+    char enteredPore;
+%}
+
+/* The INITIALIZE section is executed when the simulation starts     */
+/* (C code). You may use them as component parameter values.         */
+
+INITIALIZE
+%{
+    bufferInit();
+porePitch = 0.001000;
+poresPerPlate = 91;
+    //porePitch = something
+    //poresPerPlate = something else
+
+    poreW = porePitch-PLATE_THICKNESS;
+    poreH = PORE_HEIGHT_DEFAULT;
+
+    photonCount = -1;
+
+    int ring = getRing(module_nr);
+    int moduleOnRing = getModuleOnRing(module_nr);
+
+    moduleAngle = getModuleAngle(moduleOnRing, ring);
+
+    double plateWidth = getPoreGeom(ring, plate_nr, 'w');
+    int poresOnPlateTest = floor(plateWidth/porePitch);
+    poresOnPlateTest = poresOnPlateTest - ((poresOnPlateTest + 1) & 1);
+    if(poresOnPlateTest != poresPerPlate){
+        printf("Plate dimensions do not fit with instrument file: %d / %d\n", poresPerPlate, poresOnPlateTest);
+        sleep(1);
+        exit(130);
+    }
+    int poresPerHalfPlate = poresPerPlate/2;
+
+    radiusP = getPoreGeom(ring, plate_nr, 'p');
+    radiusM = getPoreGeom(ring, plate_nr, 'm');
+    radiusH = getPoreGeom(ring, plate_nr, 'h');
+
+    int i;
+    for(i = 0; i < poresPerPlate; i++){
+        poreAngle[i] = (porePitch/radiusM)*(i - poresPerHalfPlate) + moduleAngle;
+        poreAngleDegrees[i] = poreAngle[i]/DEGTORAD;
+        poreX[i] = radiusM*cos(poreAngle[i]);
+        poreY[i] = radiusM*sin(poreAngle[i]);
+    }
+
+    thX = poreX[poresPerHalfPlate];
+    thY = poreY[poresPerHalfPlate];
+
+    thZ = -getPoreGeom(ring, plate_nr, 'l');
+
+    srcW = plateWidth*1.05;
+    srcH = srcW;
+
+    coating = malloc(100);
+    coatingSide = malloc(100);
+    coatingBottom = malloc(100);
+
+    if(energy >= 1 && energy <= 10){
+        sprintf(coating, "coatings/B4C80_Ir100_45sigma_%dkeV.dat", energy);
+        sprintf(coatingSide, "%s", coating);
+        sprintf(coatingBottom, "%s", coating);
+        printf("Selecting energy %d keV\n", energy);
+    } else {
+        energy = 1; //energy doesn't matter at this point as no coatings are set, this is to avoid e=0
+        coating = "coatings/mirror_coating_unity.txt";
+        coatingSide = coating;
+        coatingBottom = coating;
+        printf("Selecting unity reflectivity\n");
+    }
+    if(absorb_sides){
+        coatingSide = "coatings/mirror_coating_zero.txt";
+    }
+    if(absorb_bottom){
+        coatingBottom = "coatings/mirror_coating_zero";
+    }
+%}
+
+
+/* Here comes the TRACE section, where the actual      */
+/* instrument is defined as a sequence of components.  */
+TRACE
+
+COMPONENT origin = Progress_bar()
+AT (0,0,0) ABSOLUTE
+EXTEND
+%{
+    photonCount++;
+    enteredPore = 0;
+    bufferAddNewPhoton();
+%}
+
+COMPONENT ThetaArm = Arm()
+AT (thX, thY, thZ) ABSOLUTE
+ROTATED (0, source_th/60.0, 0) ABSOLUTE
+
+COMPONENT srcDirectional = Source_div(
+E0=energy,
+dE=dEnergy,
+xwidth=srcW,
+yheight=srcH,
+focus_aw=source_dx/60*DEGTORAD,
+focus_ah=source_dy/60*DEGTORAD,
+gauss=0)
+WHEN(source_type == 0)
+AT(0, 0, -sourceToOptics) RELATIVE ThetaArm
+ROTATED (0, 0, 0) RELATIVE ThetaArm
+
+COMPONENT srcDirectionalWide = Source_div(
+E0=energy,
+dE=dEnergy,
+xwidth=3*srcW,
+yheight=3*srcH,
+focus_aw=source_dx/60*DEGTORAD,
+focus_ah=source_dy/60*DEGTORAD,
+gauss=0)
+WHEN(source_type == 1)
+AT(0, 0, -sourceToOptics) RELATIVE ThetaArm
+ROTATED (0, 0, 0) RELATIVE ThetaArm
+
+//==============================================================================
+//BEGIN PROCEDURAL PART
+//==============================================================================
+COMPONENT PoreArm0 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[0]-90) ABSOLUTE
+
+COMPONENT PoreArm1 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[1]-90) ABSOLUTE
+
+COMPONENT PoreArm2 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[2]-90) ABSOLUTE
+
+COMPONENT PoreArm3 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[3]-90) ABSOLUTE
+
+COMPONENT PoreArm4 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[4]-90) ABSOLUTE
+
+COMPONENT PoreArm5 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[5]-90) ABSOLUTE
+
+COMPONENT PoreArm6 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[6]-90) ABSOLUTE
+
+COMPONENT PoreArm7 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[7]-90) ABSOLUTE
+
+COMPONENT PoreArm8 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[8]-90) ABSOLUTE
+
+COMPONENT PoreArm9 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[9]-90) ABSOLUTE
+
+COMPONENT PoreArm10 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[10]-90) ABSOLUTE
+
+COMPONENT PoreArm11 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[11]-90) ABSOLUTE
+
+COMPONENT PoreArm12 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[12]-90) ABSOLUTE
+
+COMPONENT PoreArm13 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[13]-90) ABSOLUTE
+
+COMPONENT PoreArm14 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[14]-90) ABSOLUTE
+
+COMPONENT PoreArm15 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[15]-90) ABSOLUTE
+
+COMPONENT PoreArm16 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[16]-90) ABSOLUTE
+
+COMPONENT PoreArm17 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[17]-90) ABSOLUTE
+
+COMPONENT PoreArm18 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[18]-90) ABSOLUTE
+
+COMPONENT PoreArm19 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[19]-90) ABSOLUTE
+
+COMPONENT PoreArm20 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[20]-90) ABSOLUTE
+
+COMPONENT PoreArm21 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[21]-90) ABSOLUTE
+
+COMPONENT PoreArm22 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[22]-90) ABSOLUTE
+
+COMPONENT PoreArm23 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[23]-90) ABSOLUTE
+
+COMPONENT PoreArm24 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[24]-90) ABSOLUTE
+
+COMPONENT PoreArm25 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[25]-90) ABSOLUTE
+
+COMPONENT PoreArm26 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[26]-90) ABSOLUTE
+
+COMPONENT PoreArm27 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[27]-90) ABSOLUTE
+
+COMPONENT PoreArm28 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[28]-90) ABSOLUTE
+
+COMPONENT PoreArm29 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[29]-90) ABSOLUTE
+
+COMPONENT PoreArm30 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[30]-90) ABSOLUTE
+
+COMPONENT PoreArm31 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[31]-90) ABSOLUTE
+
+COMPONENT PoreArm32 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[32]-90) ABSOLUTE
+
+COMPONENT PoreArm33 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[33]-90) ABSOLUTE
+
+COMPONENT PoreArm34 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[34]-90) ABSOLUTE
+
+COMPONENT PoreArm35 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[35]-90) ABSOLUTE
+
+COMPONENT PoreArm36 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[36]-90) ABSOLUTE
+
+COMPONENT PoreArm37 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[37]-90) ABSOLUTE
+
+COMPONENT PoreArm38 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[38]-90) ABSOLUTE
+
+COMPONENT PoreArm39 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[39]-90) ABSOLUTE
+
+COMPONENT PoreArm40 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[40]-90) ABSOLUTE
+
+COMPONENT PoreArm41 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[41]-90) ABSOLUTE
+
+COMPONENT PoreArm42 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[42]-90) ABSOLUTE
+
+COMPONENT PoreArm43 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[43]-90) ABSOLUTE
+
+COMPONENT PoreArm44 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[44]-90) ABSOLUTE
+
+COMPONENT PoreArm45 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[45]-90) ABSOLUTE
+
+COMPONENT PoreArm46 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[46]-90) ABSOLUTE
+
+COMPONENT PoreArm47 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[47]-90) ABSOLUTE
+
+COMPONENT PoreArm48 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[48]-90) ABSOLUTE
+
+COMPONENT PoreArm49 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[49]-90) ABSOLUTE
+
+COMPONENT PoreArm50 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[50]-90) ABSOLUTE
+
+COMPONENT PoreArm51 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[51]-90) ABSOLUTE
+
+COMPONENT PoreArm52 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[52]-90) ABSOLUTE
+
+COMPONENT PoreArm53 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[53]-90) ABSOLUTE
+
+COMPONENT PoreArm54 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[54]-90) ABSOLUTE
+
+COMPONENT PoreArm55 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[55]-90) ABSOLUTE
+
+COMPONENT PoreArm56 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[56]-90) ABSOLUTE
+
+COMPONENT PoreArm57 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[57]-90) ABSOLUTE
+
+COMPONENT PoreArm58 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[58]-90) ABSOLUTE
+
+COMPONENT PoreArm59 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[59]-90) ABSOLUTE
+
+COMPONENT PoreArm60 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[60]-90) ABSOLUTE
+
+COMPONENT PoreArm61 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[61]-90) ABSOLUTE
+
+COMPONENT PoreArm62 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[62]-90) ABSOLUTE
+
+COMPONENT PoreArm63 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[63]-90) ABSOLUTE
+
+COMPONENT PoreArm64 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[64]-90) ABSOLUTE
+
+COMPONENT PoreArm65 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[65]-90) ABSOLUTE
+
+COMPONENT PoreArm66 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[66]-90) ABSOLUTE
+
+COMPONENT PoreArm67 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[67]-90) ABSOLUTE
+
+COMPONENT PoreArm68 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[68]-90) ABSOLUTE
+
+COMPONENT PoreArm69 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[69]-90) ABSOLUTE
+
+COMPONENT PoreArm70 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[70]-90) ABSOLUTE
+
+COMPONENT PoreArm71 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[71]-90) ABSOLUTE
+
+COMPONENT PoreArm72 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[72]-90) ABSOLUTE
+
+COMPONENT PoreArm73 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[73]-90) ABSOLUTE
+
+COMPONENT PoreArm74 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[74]-90) ABSOLUTE
+
+COMPONENT PoreArm75 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[75]-90) ABSOLUTE
+
+COMPONENT PoreArm76 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[76]-90) ABSOLUTE
+
+COMPONENT PoreArm77 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[77]-90) ABSOLUTE
+
+COMPONENT PoreArm78 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[78]-90) ABSOLUTE
+
+COMPONENT PoreArm79 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[79]-90) ABSOLUTE
+
+COMPONENT PoreArm80 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[80]-90) ABSOLUTE
+
+COMPONENT PoreArm81 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[81]-90) ABSOLUTE
+
+COMPONENT PoreArm82 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[82]-90) ABSOLUTE
+
+COMPONENT PoreArm83 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[83]-90) ABSOLUTE
+
+COMPONENT PoreArm84 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[84]-90) ABSOLUTE
+
+COMPONENT PoreArm85 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[85]-90) ABSOLUTE
+
+COMPONENT PoreArm86 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[86]-90) ABSOLUTE
+
+COMPONENT PoreArm87 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[87]-90) ABSOLUTE
+
+COMPONENT PoreArm88 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[88]-90) ABSOLUTE
+
+COMPONENT PoreArm89 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[89]-90) ABSOLUTE
+
+COMPONENT PoreArm90 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[90]-90) ABSOLUTE
+
+
+
+COMPONENT PoreP0 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm0
+ROTATED (0, 0, 0) RELATIVE PoreArm0
+GROUP parabolic
+
+COMPONENT PoreP1 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm1
+ROTATED (0, 0, 0) RELATIVE PoreArm1
+GROUP parabolic
+
+COMPONENT PoreP2 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm2
+ROTATED (0, 0, 0) RELATIVE PoreArm2
+GROUP parabolic
+
+COMPONENT PoreP3 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm3
+ROTATED (0, 0, 0) RELATIVE PoreArm3
+GROUP parabolic
+
+COMPONENT PoreP4 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm4
+ROTATED (0, 0, 0) RELATIVE PoreArm4
+GROUP parabolic
+
+COMPONENT PoreP5 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm5
+ROTATED (0, 0, 0) RELATIVE PoreArm5
+GROUP parabolic
+
+COMPONENT PoreP6 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm6
+ROTATED (0, 0, 0) RELATIVE PoreArm6
+GROUP parabolic
+
+COMPONENT PoreP7 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm7
+ROTATED (0, 0, 0) RELATIVE PoreArm7
+GROUP parabolic
+
+COMPONENT PoreP8 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm8
+ROTATED (0, 0, 0) RELATIVE PoreArm8
+GROUP parabolic
+
+COMPONENT PoreP9 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm9
+ROTATED (0, 0, 0) RELATIVE PoreArm9
+GROUP parabolic
+
+COMPONENT PoreP10 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm10
+ROTATED (0, 0, 0) RELATIVE PoreArm10
+GROUP parabolic
+
+COMPONENT PoreP11 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm11
+ROTATED (0, 0, 0) RELATIVE PoreArm11
+GROUP parabolic
+
+COMPONENT PoreP12 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm12
+ROTATED (0, 0, 0) RELATIVE PoreArm12
+GROUP parabolic
+
+COMPONENT PoreP13 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm13
+ROTATED (0, 0, 0) RELATIVE PoreArm13
+GROUP parabolic
+
+COMPONENT PoreP14 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm14
+ROTATED (0, 0, 0) RELATIVE PoreArm14
+GROUP parabolic
+
+COMPONENT PoreP15 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm15
+ROTATED (0, 0, 0) RELATIVE PoreArm15
+GROUP parabolic
+
+COMPONENT PoreP16 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm16
+ROTATED (0, 0, 0) RELATIVE PoreArm16
+GROUP parabolic
+
+COMPONENT PoreP17 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm17
+ROTATED (0, 0, 0) RELATIVE PoreArm17
+GROUP parabolic
+
+COMPONENT PoreP18 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm18
+ROTATED (0, 0, 0) RELATIVE PoreArm18
+GROUP parabolic
+
+COMPONENT PoreP19 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm19
+ROTATED (0, 0, 0) RELATIVE PoreArm19
+GROUP parabolic
+
+COMPONENT PoreP20 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm20
+ROTATED (0, 0, 0) RELATIVE PoreArm20
+GROUP parabolic
+
+COMPONENT PoreP21 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm21
+ROTATED (0, 0, 0) RELATIVE PoreArm21
+GROUP parabolic
+
+COMPONENT PoreP22 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm22
+ROTATED (0, 0, 0) RELATIVE PoreArm22
+GROUP parabolic
+
+COMPONENT PoreP23 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm23
+ROTATED (0, 0, 0) RELATIVE PoreArm23
+GROUP parabolic
+
+COMPONENT PoreP24 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm24
+ROTATED (0, 0, 0) RELATIVE PoreArm24
+GROUP parabolic
+
+COMPONENT PoreP25 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm25
+ROTATED (0, 0, 0) RELATIVE PoreArm25
+GROUP parabolic
+
+COMPONENT PoreP26 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm26
+ROTATED (0, 0, 0) RELATIVE PoreArm26
+GROUP parabolic
+
+COMPONENT PoreP27 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm27
+ROTATED (0, 0, 0) RELATIVE PoreArm27
+GROUP parabolic
+
+COMPONENT PoreP28 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm28
+ROTATED (0, 0, 0) RELATIVE PoreArm28
+GROUP parabolic
+
+COMPONENT PoreP29 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm29
+ROTATED (0, 0, 0) RELATIVE PoreArm29
+GROUP parabolic
+
+COMPONENT PoreP30 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm30
+ROTATED (0, 0, 0) RELATIVE PoreArm30
+GROUP parabolic
+
+COMPONENT PoreP31 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm31
+ROTATED (0, 0, 0) RELATIVE PoreArm31
+GROUP parabolic
+
+COMPONENT PoreP32 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm32
+ROTATED (0, 0, 0) RELATIVE PoreArm32
+GROUP parabolic
+
+COMPONENT PoreP33 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm33
+ROTATED (0, 0, 0) RELATIVE PoreArm33
+GROUP parabolic
+
+COMPONENT PoreP34 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm34
+ROTATED (0, 0, 0) RELATIVE PoreArm34
+GROUP parabolic
+
+COMPONENT PoreP35 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm35
+ROTATED (0, 0, 0) RELATIVE PoreArm35
+GROUP parabolic
+
+COMPONENT PoreP36 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm36
+ROTATED (0, 0, 0) RELATIVE PoreArm36
+GROUP parabolic
+
+COMPONENT PoreP37 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm37
+ROTATED (0, 0, 0) RELATIVE PoreArm37
+GROUP parabolic
+
+COMPONENT PoreP38 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm38
+ROTATED (0, 0, 0) RELATIVE PoreArm38
+GROUP parabolic
+
+COMPONENT PoreP39 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm39
+ROTATED (0, 0, 0) RELATIVE PoreArm39
+GROUP parabolic
+
+COMPONENT PoreP40 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm40
+ROTATED (0, 0, 0) RELATIVE PoreArm40
+GROUP parabolic
+
+COMPONENT PoreP41 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm41
+ROTATED (0, 0, 0) RELATIVE PoreArm41
+GROUP parabolic
+
+COMPONENT PoreP42 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm42
+ROTATED (0, 0, 0) RELATIVE PoreArm42
+GROUP parabolic
+
+COMPONENT PoreP43 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm43
+ROTATED (0, 0, 0) RELATIVE PoreArm43
+GROUP parabolic
+
+COMPONENT PoreP44 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm44
+ROTATED (0, 0, 0) RELATIVE PoreArm44
+GROUP parabolic
+
+COMPONENT PoreP45 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm45
+ROTATED (0, 0, 0) RELATIVE PoreArm45
+GROUP parabolic
+
+COMPONENT PoreP46 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm46
+ROTATED (0, 0, 0) RELATIVE PoreArm46
+GROUP parabolic
+
+COMPONENT PoreP47 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm47
+ROTATED (0, 0, 0) RELATIVE PoreArm47
+GROUP parabolic
+
+COMPONENT PoreP48 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm48
+ROTATED (0, 0, 0) RELATIVE PoreArm48
+GROUP parabolic
+
+COMPONENT PoreP49 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm49
+ROTATED (0, 0, 0) RELATIVE PoreArm49
+GROUP parabolic
+
+COMPONENT PoreP50 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm50
+ROTATED (0, 0, 0) RELATIVE PoreArm50
+GROUP parabolic
+
+COMPONENT PoreP51 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm51
+ROTATED (0, 0, 0) RELATIVE PoreArm51
+GROUP parabolic
+
+COMPONENT PoreP52 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm52
+ROTATED (0, 0, 0) RELATIVE PoreArm52
+GROUP parabolic
+
+COMPONENT PoreP53 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm53
+ROTATED (0, 0, 0) RELATIVE PoreArm53
+GROUP parabolic
+
+COMPONENT PoreP54 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm54
+ROTATED (0, 0, 0) RELATIVE PoreArm54
+GROUP parabolic
+
+COMPONENT PoreP55 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm55
+ROTATED (0, 0, 0) RELATIVE PoreArm55
+GROUP parabolic
+
+COMPONENT PoreP56 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm56
+ROTATED (0, 0, 0) RELATIVE PoreArm56
+GROUP parabolic
+
+COMPONENT PoreP57 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm57
+ROTATED (0, 0, 0) RELATIVE PoreArm57
+GROUP parabolic
+
+COMPONENT PoreP58 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm58
+ROTATED (0, 0, 0) RELATIVE PoreArm58
+GROUP parabolic
+
+COMPONENT PoreP59 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm59
+ROTATED (0, 0, 0) RELATIVE PoreArm59
+GROUP parabolic
+
+COMPONENT PoreP60 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm60
+ROTATED (0, 0, 0) RELATIVE PoreArm60
+GROUP parabolic
+
+COMPONENT PoreP61 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm61
+ROTATED (0, 0, 0) RELATIVE PoreArm61
+GROUP parabolic
+
+COMPONENT PoreP62 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm62
+ROTATED (0, 0, 0) RELATIVE PoreArm62
+GROUP parabolic
+
+COMPONENT PoreP63 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm63
+ROTATED (0, 0, 0) RELATIVE PoreArm63
+GROUP parabolic
+
+COMPONENT PoreP64 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm64
+ROTATED (0, 0, 0) RELATIVE PoreArm64
+GROUP parabolic
+
+COMPONENT PoreP65 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm65
+ROTATED (0, 0, 0) RELATIVE PoreArm65
+GROUP parabolic
+
+COMPONENT PoreP66 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm66
+ROTATED (0, 0, 0) RELATIVE PoreArm66
+GROUP parabolic
+
+COMPONENT PoreP67 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm67
+ROTATED (0, 0, 0) RELATIVE PoreArm67
+GROUP parabolic
+
+COMPONENT PoreP68 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm68
+ROTATED (0, 0, 0) RELATIVE PoreArm68
+GROUP parabolic
+
+COMPONENT PoreP69 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm69
+ROTATED (0, 0, 0) RELATIVE PoreArm69
+GROUP parabolic
+
+COMPONENT PoreP70 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm70
+ROTATED (0, 0, 0) RELATIVE PoreArm70
+GROUP parabolic
+
+COMPONENT PoreP71 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm71
+ROTATED (0, 0, 0) RELATIVE PoreArm71
+GROUP parabolic
+
+COMPONENT PoreP72 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm72
+ROTATED (0, 0, 0) RELATIVE PoreArm72
+GROUP parabolic
+
+COMPONENT PoreP73 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm73
+ROTATED (0, 0, 0) RELATIVE PoreArm73
+GROUP parabolic
+
+COMPONENT PoreP74 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm74
+ROTATED (0, 0, 0) RELATIVE PoreArm74
+GROUP parabolic
+
+COMPONENT PoreP75 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm75
+ROTATED (0, 0, 0) RELATIVE PoreArm75
+GROUP parabolic
+
+COMPONENT PoreP76 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm76
+ROTATED (0, 0, 0) RELATIVE PoreArm76
+GROUP parabolic
+
+COMPONENT PoreP77 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm77
+ROTATED (0, 0, 0) RELATIVE PoreArm77
+GROUP parabolic
+
+COMPONENT PoreP78 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm78
+ROTATED (0, 0, 0) RELATIVE PoreArm78
+GROUP parabolic
+
+COMPONENT PoreP79 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm79
+ROTATED (0, 0, 0) RELATIVE PoreArm79
+GROUP parabolic
+
+COMPONENT PoreP80 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm80
+ROTATED (0, 0, 0) RELATIVE PoreArm80
+GROUP parabolic
+
+COMPONENT PoreP81 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm81
+ROTATED (0, 0, 0) RELATIVE PoreArm81
+GROUP parabolic
+
+COMPONENT PoreP82 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm82
+ROTATED (0, 0, 0) RELATIVE PoreArm82
+GROUP parabolic
+
+COMPONENT PoreP83 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm83
+ROTATED (0, 0, 0) RELATIVE PoreArm83
+GROUP parabolic
+
+COMPONENT PoreP84 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm84
+ROTATED (0, 0, 0) RELATIVE PoreArm84
+GROUP parabolic
+
+COMPONENT PoreP85 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm85
+ROTATED (0, 0, 0) RELATIVE PoreArm85
+GROUP parabolic
+
+COMPONENT PoreP86 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm86
+ROTATED (0, 0, 0) RELATIVE PoreArm86
+GROUP parabolic
+
+COMPONENT PoreP87 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm87
+ROTATED (0, 0, 0) RELATIVE PoreArm87
+GROUP parabolic
+
+COMPONENT PoreP88 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm88
+ROTATED (0, 0, 0) RELATIVE PoreArm88
+GROUP parabolic
+
+COMPONENT PoreP89 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm89
+ROTATED (0, 0, 0) RELATIVE PoreArm89
+GROUP parabolic
+
+COMPONENT PoreP90 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm90
+ROTATED (0, 0, 0) RELATIVE PoreArm90
+GROUP parabolic EXTEND
+%{
+if(!enteredPore){
+bufferRemoveCurrentPhoton();
+ABSORB;}
+%}
+
+COMPONENT PoreH0 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm0
+ROTATED (0, 0, 0) RELATIVE PoreArm0
+GROUP hyperbolic
+
+COMPONENT PoreH1 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm1
+ROTATED (0, 0, 0) RELATIVE PoreArm1
+GROUP hyperbolic
+
+COMPONENT PoreH2 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm2
+ROTATED (0, 0, 0) RELATIVE PoreArm2
+GROUP hyperbolic
+
+COMPONENT PoreH3 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm3
+ROTATED (0, 0, 0) RELATIVE PoreArm3
+GROUP hyperbolic
+
+COMPONENT PoreH4 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm4
+ROTATED (0, 0, 0) RELATIVE PoreArm4
+GROUP hyperbolic
+
+COMPONENT PoreH5 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm5
+ROTATED (0, 0, 0) RELATIVE PoreArm5
+GROUP hyperbolic
+
+COMPONENT PoreH6 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm6
+ROTATED (0, 0, 0) RELATIVE PoreArm6
+GROUP hyperbolic
+
+COMPONENT PoreH7 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm7
+ROTATED (0, 0, 0) RELATIVE PoreArm7
+GROUP hyperbolic
+
+COMPONENT PoreH8 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm8
+ROTATED (0, 0, 0) RELATIVE PoreArm8
+GROUP hyperbolic
+
+COMPONENT PoreH9 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm9
+ROTATED (0, 0, 0) RELATIVE PoreArm9
+GROUP hyperbolic
+
+COMPONENT PoreH10 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm10
+ROTATED (0, 0, 0) RELATIVE PoreArm10
+GROUP hyperbolic
+
+COMPONENT PoreH11 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm11
+ROTATED (0, 0, 0) RELATIVE PoreArm11
+GROUP hyperbolic
+
+COMPONENT PoreH12 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm12
+ROTATED (0, 0, 0) RELATIVE PoreArm12
+GROUP hyperbolic
+
+COMPONENT PoreH13 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm13
+ROTATED (0, 0, 0) RELATIVE PoreArm13
+GROUP hyperbolic
+
+COMPONENT PoreH14 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm14
+ROTATED (0, 0, 0) RELATIVE PoreArm14
+GROUP hyperbolic
+
+COMPONENT PoreH15 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm15
+ROTATED (0, 0, 0) RELATIVE PoreArm15
+GROUP hyperbolic
+
+COMPONENT PoreH16 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm16
+ROTATED (0, 0, 0) RELATIVE PoreArm16
+GROUP hyperbolic
+
+COMPONENT PoreH17 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm17
+ROTATED (0, 0, 0) RELATIVE PoreArm17
+GROUP hyperbolic
+
+COMPONENT PoreH18 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm18
+ROTATED (0, 0, 0) RELATIVE PoreArm18
+GROUP hyperbolic
+
+COMPONENT PoreH19 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm19
+ROTATED (0, 0, 0) RELATIVE PoreArm19
+GROUP hyperbolic
+
+COMPONENT PoreH20 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm20
+ROTATED (0, 0, 0) RELATIVE PoreArm20
+GROUP hyperbolic
+
+COMPONENT PoreH21 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm21
+ROTATED (0, 0, 0) RELATIVE PoreArm21
+GROUP hyperbolic
+
+COMPONENT PoreH22 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm22
+ROTATED (0, 0, 0) RELATIVE PoreArm22
+GROUP hyperbolic
+
+COMPONENT PoreH23 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm23
+ROTATED (0, 0, 0) RELATIVE PoreArm23
+GROUP hyperbolic
+
+COMPONENT PoreH24 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm24
+ROTATED (0, 0, 0) RELATIVE PoreArm24
+GROUP hyperbolic
+
+COMPONENT PoreH25 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm25
+ROTATED (0, 0, 0) RELATIVE PoreArm25
+GROUP hyperbolic
+
+COMPONENT PoreH26 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm26
+ROTATED (0, 0, 0) RELATIVE PoreArm26
+GROUP hyperbolic
+
+COMPONENT PoreH27 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm27
+ROTATED (0, 0, 0) RELATIVE PoreArm27
+GROUP hyperbolic
+
+COMPONENT PoreH28 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm28
+ROTATED (0, 0, 0) RELATIVE PoreArm28
+GROUP hyperbolic
+
+COMPONENT PoreH29 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm29
+ROTATED (0, 0, 0) RELATIVE PoreArm29
+GROUP hyperbolic
+
+COMPONENT PoreH30 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm30
+ROTATED (0, 0, 0) RELATIVE PoreArm30
+GROUP hyperbolic
+
+COMPONENT PoreH31 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm31
+ROTATED (0, 0, 0) RELATIVE PoreArm31
+GROUP hyperbolic
+
+COMPONENT PoreH32 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm32
+ROTATED (0, 0, 0) RELATIVE PoreArm32
+GROUP hyperbolic
+
+COMPONENT PoreH33 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm33
+ROTATED (0, 0, 0) RELATIVE PoreArm33
+GROUP hyperbolic
+
+COMPONENT PoreH34 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm34
+ROTATED (0, 0, 0) RELATIVE PoreArm34
+GROUP hyperbolic
+
+COMPONENT PoreH35 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm35
+ROTATED (0, 0, 0) RELATIVE PoreArm35
+GROUP hyperbolic
+
+COMPONENT PoreH36 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm36
+ROTATED (0, 0, 0) RELATIVE PoreArm36
+GROUP hyperbolic
+
+COMPONENT PoreH37 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm37
+ROTATED (0, 0, 0) RELATIVE PoreArm37
+GROUP hyperbolic
+
+COMPONENT PoreH38 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm38
+ROTATED (0, 0, 0) RELATIVE PoreArm38
+GROUP hyperbolic
+
+COMPONENT PoreH39 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm39
+ROTATED (0, 0, 0) RELATIVE PoreArm39
+GROUP hyperbolic
+
+COMPONENT PoreH40 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm40
+ROTATED (0, 0, 0) RELATIVE PoreArm40
+GROUP hyperbolic
+
+COMPONENT PoreH41 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm41
+ROTATED (0, 0, 0) RELATIVE PoreArm41
+GROUP hyperbolic
+
+COMPONENT PoreH42 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm42
+ROTATED (0, 0, 0) RELATIVE PoreArm42
+GROUP hyperbolic
+
+COMPONENT PoreH43 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm43
+ROTATED (0, 0, 0) RELATIVE PoreArm43
+GROUP hyperbolic
+
+COMPONENT PoreH44 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm44
+ROTATED (0, 0, 0) RELATIVE PoreArm44
+GROUP hyperbolic
+
+COMPONENT PoreH45 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm45
+ROTATED (0, 0, 0) RELATIVE PoreArm45
+GROUP hyperbolic
+
+COMPONENT PoreH46 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm46
+ROTATED (0, 0, 0) RELATIVE PoreArm46
+GROUP hyperbolic
+
+COMPONENT PoreH47 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm47
+ROTATED (0, 0, 0) RELATIVE PoreArm47
+GROUP hyperbolic
+
+COMPONENT PoreH48 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm48
+ROTATED (0, 0, 0) RELATIVE PoreArm48
+GROUP hyperbolic
+
+COMPONENT PoreH49 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm49
+ROTATED (0, 0, 0) RELATIVE PoreArm49
+GROUP hyperbolic
+
+COMPONENT PoreH50 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm50
+ROTATED (0, 0, 0) RELATIVE PoreArm50
+GROUP hyperbolic
+
+COMPONENT PoreH51 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm51
+ROTATED (0, 0, 0) RELATIVE PoreArm51
+GROUP hyperbolic
+
+COMPONENT PoreH52 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm52
+ROTATED (0, 0, 0) RELATIVE PoreArm52
+GROUP hyperbolic
+
+COMPONENT PoreH53 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm53
+ROTATED (0, 0, 0) RELATIVE PoreArm53
+GROUP hyperbolic
+
+COMPONENT PoreH54 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm54
+ROTATED (0, 0, 0) RELATIVE PoreArm54
+GROUP hyperbolic
+
+COMPONENT PoreH55 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm55
+ROTATED (0, 0, 0) RELATIVE PoreArm55
+GROUP hyperbolic
+
+COMPONENT PoreH56 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm56
+ROTATED (0, 0, 0) RELATIVE PoreArm56
+GROUP hyperbolic
+
+COMPONENT PoreH57 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm57
+ROTATED (0, 0, 0) RELATIVE PoreArm57
+GROUP hyperbolic
+
+COMPONENT PoreH58 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm58
+ROTATED (0, 0, 0) RELATIVE PoreArm58
+GROUP hyperbolic
+
+COMPONENT PoreH59 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm59
+ROTATED (0, 0, 0) RELATIVE PoreArm59
+GROUP hyperbolic
+
+COMPONENT PoreH60 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm60
+ROTATED (0, 0, 0) RELATIVE PoreArm60
+GROUP hyperbolic
+
+COMPONENT PoreH61 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm61
+ROTATED (0, 0, 0) RELATIVE PoreArm61
+GROUP hyperbolic
+
+COMPONENT PoreH62 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm62
+ROTATED (0, 0, 0) RELATIVE PoreArm62
+GROUP hyperbolic
+
+COMPONENT PoreH63 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm63
+ROTATED (0, 0, 0) RELATIVE PoreArm63
+GROUP hyperbolic
+
+COMPONENT PoreH64 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm64
+ROTATED (0, 0, 0) RELATIVE PoreArm64
+GROUP hyperbolic
+
+COMPONENT PoreH65 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm65
+ROTATED (0, 0, 0) RELATIVE PoreArm65
+GROUP hyperbolic
+
+COMPONENT PoreH66 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm66
+ROTATED (0, 0, 0) RELATIVE PoreArm66
+GROUP hyperbolic
+
+COMPONENT PoreH67 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm67
+ROTATED (0, 0, 0) RELATIVE PoreArm67
+GROUP hyperbolic
+
+COMPONENT PoreH68 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm68
+ROTATED (0, 0, 0) RELATIVE PoreArm68
+GROUP hyperbolic
+
+COMPONENT PoreH69 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm69
+ROTATED (0, 0, 0) RELATIVE PoreArm69
+GROUP hyperbolic
+
+COMPONENT PoreH70 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm70
+ROTATED (0, 0, 0) RELATIVE PoreArm70
+GROUP hyperbolic
+
+COMPONENT PoreH71 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm71
+ROTATED (0, 0, 0) RELATIVE PoreArm71
+GROUP hyperbolic
+
+COMPONENT PoreH72 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm72
+ROTATED (0, 0, 0) RELATIVE PoreArm72
+GROUP hyperbolic
+
+COMPONENT PoreH73 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm73
+ROTATED (0, 0, 0) RELATIVE PoreArm73
+GROUP hyperbolic
+
+COMPONENT PoreH74 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm74
+ROTATED (0, 0, 0) RELATIVE PoreArm74
+GROUP hyperbolic
+
+COMPONENT PoreH75 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm75
+ROTATED (0, 0, 0) RELATIVE PoreArm75
+GROUP hyperbolic
+
+COMPONENT PoreH76 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm76
+ROTATED (0, 0, 0) RELATIVE PoreArm76
+GROUP hyperbolic
+
+COMPONENT PoreH77 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm77
+ROTATED (0, 0, 0) RELATIVE PoreArm77
+GROUP hyperbolic
+
+COMPONENT PoreH78 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm78
+ROTATED (0, 0, 0) RELATIVE PoreArm78
+GROUP hyperbolic
+
+COMPONENT PoreH79 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm79
+ROTATED (0, 0, 0) RELATIVE PoreArm79
+GROUP hyperbolic
+
+COMPONENT PoreH80 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm80
+ROTATED (0, 0, 0) RELATIVE PoreArm80
+GROUP hyperbolic
+
+COMPONENT PoreH81 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm81
+ROTATED (0, 0, 0) RELATIVE PoreArm81
+GROUP hyperbolic
+
+COMPONENT PoreH82 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm82
+ROTATED (0, 0, 0) RELATIVE PoreArm82
+GROUP hyperbolic
+
+COMPONENT PoreH83 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm83
+ROTATED (0, 0, 0) RELATIVE PoreArm83
+GROUP hyperbolic
+
+COMPONENT PoreH84 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm84
+ROTATED (0, 0, 0) RELATIVE PoreArm84
+GROUP hyperbolic
+
+COMPONENT PoreH85 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm85
+ROTATED (0, 0, 0) RELATIVE PoreArm85
+GROUP hyperbolic
+
+COMPONENT PoreH86 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm86
+ROTATED (0, 0, 0) RELATIVE PoreArm86
+GROUP hyperbolic
+
+COMPONENT PoreH87 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm87
+ROTATED (0, 0, 0) RELATIVE PoreArm87
+GROUP hyperbolic
+
+COMPONENT PoreH88 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm88
+ROTATED (0, 0, 0) RELATIVE PoreArm88
+GROUP hyperbolic
+
+COMPONENT PoreH89 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm89
+ROTATED (0, 0, 0) RELATIVE PoreArm89
+GROUP hyperbolic
+
+COMPONENT PoreH90 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm90
+ROTATED (0, 0, 0) RELATIVE PoreArm90
+GROUP hyperbolic//==============================================================================
+// END OF PROCEDURAL PART
+//==============================================================================
+
+COMPONENT monitorAfter = PSD_monitor_ext(
+    //filename = "afterMonitor.dat",
+    restore_xray=1,
+    xwidth=wideSize,
+    yheight=wideSize,
+    nx = wideResolution, ny = wideResolution)
+    AT (0, 0, 0.15) ABSOLUTE
+    EXTEND
+    %{
+        photonPassedThrough++;
+        photonPassedThroughWeighted += p;
+        bufferAddPlanePosition(EXITP, posx, posy, 0.15);
+        bufferAddPhotonInfo(p);
+    %}
+
+// COMPONENT endMonitor = PSD_monitor(
+//     //filename = "endMonitor.dat",
+//     restore_xray=1,
+//     xwidth=detectorSize,
+//     yheight=detectorSize,
+//     nx = finalResolution, ny = finalResolution)
+//     AT (0, 0, focalLength) ABSOLUTE
+//     EXTEND
+//     %{
+//         bufferAdd
+//     %}
+
+COMPONENT endMonitorWide = PSD_monitor_ext(
+    //filename = "endMonitorWide.dat",
+    restore_xray=0,
+    xwidth=wideSize,
+    yheight=wideSize,
+    nx = wideResolution, ny = wideResolution)
+    AT (0, 0, focalLength) ABSOLUTE
+    EXTEND
+    %{
+        bufferAddAbsorb(FOCALPLANE, posx, posy, focalLength);
+    %}
+
+/* This section is executed when the simulation ends (C code). Other    */
+/* optional sections are : SAVE                                         */
+FINALLY
+%{
+    photonCount++;
+
+    double sourceFlux = photonCount/srcW/srcH;
+
+    bufferAddRunInfo(photonCount, photonPassedThrough, photonPassedThroughWeighted, sourceFlux, radiusM);
+    bufferEndOfRun();
+
+    char fn[256];
+    sprintf(fn, "%s.dat", output_filename);
+
+    FILE *fp = fopen(fn, "a");
+    // showBufferHead();
+    bufferWriteAndReset(fp);
+    fflush(fp);
+    fclose(fp);
+%}
+
+/* The END token marks the instrument definition end */
+END

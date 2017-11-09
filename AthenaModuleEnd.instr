@@ -1,0 +1,66 @@
+//==============================================================================
+// END OF PROCEDURAL PART
+//==============================================================================
+
+COMPONENT monitorAfter = PSD_monitor_ext(
+    //filename = "afterMonitor.dat",
+    restore_xray=1,
+    xwidth=wideSize,
+    yheight=wideSize,
+    nx = wideResolution, ny = wideResolution)
+    AT (0, 0, 0.15) ABSOLUTE
+    EXTEND
+    %{
+        photonPassedThrough++;
+        photonPassedThroughWeighted += p;
+        bufferAddPlanePosition(EXITP, posx, posy, 0.15);
+        bufferAddPhotonInfo(p);
+    %}
+
+// COMPONENT endMonitor = PSD_monitor(
+//     //filename = "endMonitor.dat",
+//     restore_xray=1,
+//     xwidth=detectorSize,
+//     yheight=detectorSize,
+//     nx = finalResolution, ny = finalResolution)
+//     AT (0, 0, focalLength) ABSOLUTE
+//     EXTEND
+//     %{
+//         bufferAdd
+//     %}
+
+COMPONENT endMonitorWide = PSD_monitor_ext(
+    //filename = "endMonitorWide.dat",
+    restore_xray=0,
+    xwidth=wideSize,
+    yheight=wideSize,
+    nx = wideResolution, ny = wideResolution)
+    AT (0, 0, focalLength) ABSOLUTE
+    EXTEND
+    %{
+        bufferAddAbsorb(FOCALPLANE, posx, posy, focalLength);
+    %}
+
+/* This section is executed when the simulation ends (C code). Other    */
+/* optional sections are : SAVE                                         */
+FINALLY
+%{
+    photonCount++;
+
+    double sourceFlux = photonCount/srcW/srcH;
+
+    bufferAddRunInfo(photonCount, photonPassedThrough, photonPassedThroughWeighted, sourceFlux, radiusM);
+    bufferEndOfRun();
+
+    char fn[256];
+    sprintf(fn, "%s.dat", output_filename);
+
+    FILE *fp = fopen(fn, "a");
+    // showBufferHead();
+    bufferWriteAndReset(fp);
+    fflush(fp);
+    fclose(fp);
+%}
+
+/* The END token marks the instrument definition end */
+END
