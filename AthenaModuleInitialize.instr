@@ -1,0 +1,112 @@
+    //porePitch = something
+    //poresPerPlate = something else
+
+    poreW = porePitch-PLATE_THICKNESS;
+    poreH = PORE_HEIGHT_DEFAULT;
+
+    photonCount = -1;
+
+    int ring = getRing(module_nr);
+    int moduleOnRing = getModuleOnRing(module_nr);
+
+    moduleAngle = getModuleAngle(moduleOnRing, ring);
+
+    double plateWidth = getPoreGeom(ring, plate_nr, 'w');
+    int poresOnPlateTest = floor(plateWidth/porePitch);
+    poresOnPlateTest = poresOnPlateTest - ((poresOnPlateTest + 1) & 1);
+    if(poresOnPlateTest != poresPerPlate){
+        printf("Plate dimensions do not fit with instrument file: %d / %d\n", poresPerPlate, poresOnPlateTest);
+        sleep(1);
+        exit(130);
+    }
+    int poresPerHalfPlate = poresPerPlate/2;
+
+    radiusP = getPoreGeom(ring, plate_nr, 'p');
+    radiusM = getPoreGeom(ring, plate_nr, 'm');
+    radiusH = getPoreGeom(ring, plate_nr, 'h');
+
+    int i;
+    for(i = 0; i < poresPerPlate; i++){
+        poreAngle[i] = (porePitch/radiusM)*(i - poresPerHalfPlate) + moduleAngle;
+        poreAngleDegrees[i] = poreAngle[i]/DEGTORAD;
+        poreX[i] = radiusM*cos(poreAngle[i]);
+        poreY[i] = radiusM*sin(poreAngle[i]);
+    }
+
+    thX = poreX[poresPerHalfPlate];
+    thY = poreY[poresPerHalfPlate];
+
+    thZ = -getPoreGeom(ring, plate_nr, 'l');
+
+    srcW = plateWidth*1.05;
+    srcH = srcW;
+
+    coating = malloc(100);
+    coatingSide = malloc(100);
+    coatingBottom = malloc(100);
+
+    if(energy >= 1 && energy <= 10){
+        sprintf(coating, "coatings/B4C80_Ir100_45sigma_%dkeV.dat", energy);
+        sprintf(coatingSide, "%s", coating);
+        sprintf(coatingBottom, "%s", coating);
+        printf("Selecting energy %d keV\n", energy);
+    } else {
+        energy = 1; //energy doesn't matter at this point as no coatings are set, this is to avoid e=0
+        coating = "coatings/mirror_coating_unity.txt";
+        coatingSide = coating;
+        coatingBottom = coating;
+        printf("Selecting unity reflectivity\n");
+    }
+    if(absorb_sides){
+        coatingSide = "coatings/mirror_coating_zero.txt";
+    }
+    if(absorb_bottom){
+        coatingBottom = "coatings/mirror_coating_zero";
+    }
+%}
+
+
+/* Here comes the TRACE section, where the actual      */
+/* instrument is defined as a sequence of components.  */
+TRACE
+
+COMPONENT origin = Progress_bar()
+AT (0,0,0) ABSOLUTE
+EXTEND
+%{
+    photonCount++;
+    enteredPore = 0;
+    bufferAddNewPhoton();
+%}
+
+COMPONENT ThetaArm = Arm()
+AT (thX, thY, thZ) ABSOLUTE
+ROTATED (0, source_th/60.0, 0) ABSOLUTE
+
+COMPONENT srcDirectional = Source_div(
+E0=energy,
+dE=dEnergy,
+xwidth=srcW,
+yheight=srcH,
+focus_aw=source_dx/60*DEGTORAD,
+focus_ah=source_dy/60*DEGTORAD,
+gauss=0)
+WHEN(source_type == 0)
+AT(0, 0, -sourceToOptics) RELATIVE ThetaArm
+ROTATED (0, 0, 0) RELATIVE ThetaArm
+
+COMPONENT srcDirectionalWide = Source_div(
+E0=energy,
+dE=dEnergy,
+xwidth=3*srcW,
+yheight=3*srcH,
+focus_aw=source_dx/60*DEGTORAD,
+focus_ah=source_dy/60*DEGTORAD,
+gauss=0)
+WHEN(source_type == 1)
+AT(0, 0, -sourceToOptics) RELATIVE ThetaArm
+ROTATED (0, 0, 0) RELATIVE ThetaArm
+
+//==============================================================================
+//BEGIN PROCEDURAL PART
+//==============================================================================
