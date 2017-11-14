@@ -35,7 +35,7 @@ for i in range(1, len(sys.argv)):
         startModule = int(sys.argv[i+1])
         i+=1
     elif sys.argv[i] == '-end':
-        endModule = int(sys.argv[i+1])
+        endModule = int(sys.argv[i+1])+1
         i+=1
     elif sys.argv[i] == '-o':
         outputPath = sys.argv[i+1]
