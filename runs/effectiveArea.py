@@ -32,7 +32,7 @@ print('Threads: %d' % threads)
 
 for a in angles:
     subprocess.call(['mkdir',  '%s/%dam' % (outputPath, a)])
-    for e in range(5, 11):
+    for e in energies:
         runpath = '%s/%dam/%dkeV' % (outputPath, a, e)
         subprocess.call(['mkdir',  runpath])
         subprocess.call(['python', 'runs/fullMirror.py', '-o', runpath, '-n', str(photons), '-a', str(a), '-e', str(e), '-t', str(threads)])
