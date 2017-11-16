@@ -14,9 +14,13 @@ for i in range(1, len(sys.argv)):
     elif sys.argv[i] == '-t':
         threads = int(sys.argv[i+1])
         i+=1
+    elif sys.argv[i] == '-n':
+        photons = int(sys.argv[i+1])
+        i+=1
     elif sys.argv[i] == '-h':
-        print('-o: output path')
-        print('-t: threads')
+        print('-o: output path (!)')
+        print('-t: threads (!)')
+        print('-n: photons')
         sys.exit(0)
 
 if outputPath == '':

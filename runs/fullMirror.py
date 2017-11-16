@@ -35,7 +35,7 @@ for i in range(1, len(sys.argv)):
         startModule = int(sys.argv[i+1])
         i+=1
     elif sys.argv[i] == '-end':
-        endModule = int(sys.argv[i+1])+1
+        endModule = int(sys.argv[i+1])
         i+=1
     elif sys.argv[i] == '-o':
         outputPath = sys.argv[i+1]
@@ -80,5 +80,5 @@ def runModuleSet(moduleRange):
         runModule(i)
 
 for i in range(0, threads):
-    r = range(startModule + i, endModule, threads)
+    r = range(startModule + i, endModule+1, threads)
     threading.Thread(target=runModuleSet, args=(r,)).start()
