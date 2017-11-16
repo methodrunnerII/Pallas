@@ -47,8 +47,8 @@
 
     if(energy >= 1 && energy <= 10){
         sprintf(coating, "coatings/B4C80_Ir100_45sigma_%dkeV.dat", energy);
-        sprintf(coatingSide, "%s", coating);
-        sprintf(coatingBottom, "%s", coating);
+        sprintf(coatingSide, "coatings/SiO2_10sigma_%dkeV.dat", energy);
+        sprintf(coatingBottom, "%s", coatingSide);
         printf("Selecting energy %d keV\n", energy);
     } else {
         energy = 1; //energy doesn't matter at this point as no coatings are set, this is to avoid e=0
