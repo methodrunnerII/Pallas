@@ -14,7 +14,8 @@
     double plateWidth = getPoreGeom(ring, plate_nr, 'w');
     int poresOnPlateTest = floor(plateWidth/porePitch);
     poresOnPlateTest = poresOnPlateTest - ((poresOnPlateTest + 1) & 1);
-    if(poresOnPlateTest != poresPerPlate){
+
+    if(!use_shell_geometry && poresOnPlateTest != poresPerPlate){
         printf("Plate dimensions do not fit with instrument file: %d / %d\n", poresPerPlate, poresOnPlateTest);
         sleep(1);
         exit(130);
@@ -62,6 +63,12 @@
     }
     if(absorb_bottom){
         coatingBottom = "coatings/mirror_coating_zero";
+    }
+
+    if(use_shell_geometry){
+        poreW = getPoreGeom(ring, plate_nr, 'w') - 2*PLATE_THICKNESS;
+        poreAngle[0] = moduleAngle;
+        poreAngleDegrees[0] = poreAngle[0]/DEGTORAD;
     }
 %}
 

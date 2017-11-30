@@ -1,0 +1,347 @@
+/*******************************************************************************
+*         McXtrace instrument definition URL=http://www.mcxtrace.org
+*
+* Instrument: AthenaSynthesisStray
+*
+* %Identification
+* Written by: Arne 'S Jegers
+* Date:
+* Origin: DTU Space
+* Release: McXtrace (version)
+* Version: 1
+* %INSTRUMENT_SITE: ESA
+*
+* Athena Silicon Pore Optics simulation
+*
+* %Description
+* Single parabolic-hyperbolic pore pair of Athena's SPO optics array. The pore pair can be set to correspond to the middle pores of any of the 1062 mirror modules. The monitor at the focal plane outputs a data file. See the FINALLY section for the specifications of this file.
+*
+* %Parameters
+*
+* %Link
+* A reference/HTML link for more information
+*
+* %End
+*******************************************************************************/
+
+DEFINE INSTRUMENT AthenaModule(
+    int module_nr = 0,
+    int plate_nr = 0,
+    int energy = 1,
+    int source_type = 0,
+    double source_th = 0,
+    double source_dx = 0,
+    double source_dy = 0,
+    int absorb_sides = 0,
+    int absorb_bottom = 0,
+    int use_shell_geometry = 0,
+    char* output_filename = "")
+
+/* The DECLARE section allows us to declare variables or  small      */
+/* functions in C syntax. These may be used in the whole instrument. */
+DECLARE
+%{
+    int min(int x, int y){
+      if(x > y){
+        return y;
+      }
+      return x;
+    }
+
+    #define TWOPI 6.283185307
+    #define DEGTORAD 0.017453293
+
+    #define FOCALLENGTH 12
+
+    #define PLATE_THICKNESS 0.00017
+    #define PORE_PITCH_DEFAULT 0.001
+    #define PLATE_PITCH_DEFAULT 0.000775
+    #define PORE_HEIGHT_DEFAULT 0.000605
+    #define PORE_WIDTH_DEFAULT 0.00083
+    #define MODULE_HEIGHT_DEFAULT 0.053645
+    #define CHAMFERWIDTH 0
+
+    #include "geom.c"
+    #include "dataOutput.c"
+    #include <unistd.h>
+
+    // Pore parameters
+    #define MAXPORES 93
+    double poreX[MAXPORES];
+    double poreY[MAXPORES];
+    double poreAngle[MAXPORES];
+    double poreAngleDegrees[MAXPORES];
+    double poreW;
+    double poreH;
+    double porePitch;
+
+    double radiusP;
+    double radiusH;
+    double radiusM;
+
+    double moduleAngle;
+    int poresPerPlate;
+
+    double parabolaDeviation;
+    double hyperbolaDeviation;
+
+    // MISC STUFF
+    double sourceToOptics = 1;
+    double focalLength = 12;
+
+    double majorRadius = 1.5;
+
+    double dEnergy = 0.00001;     //KeV
+
+    int finalResolution = 1024;
+    double detectorSize = 0.13312;
+
+    int wideResolution = 255;
+    double wideSize = 3;  //Edge size in meters of wide monitor
+
+    double thX, thY, thZ;
+    double srcW;
+    double srcH;
+
+    //Counters
+    long photonCount;
+    long photonPassedThrough;
+    double photonPassedThroughWeighted;
+
+    char* coating;
+    char* coatingSide;
+    char* coatingBottom;
+
+    char enteredPore;
+%}
+
+/* The INITIALIZE section is executed when the simulation starts     */
+/* (C code). You may use them as component parameter values.         */
+
+INITIALIZE
+%{
+    bufferInit();
+porePitch = 0.001000;
+poresPerPlate = 1;
+    //porePitch = something
+    //poresPerPlate = something else
+
+    poreW = porePitch-PLATE_THICKNESS;
+    poreH = PORE_HEIGHT_DEFAULT;
+
+    photonCount = -1;
+
+    int ring = getRing(module_nr);
+    int moduleOnRing = getModuleOnRing(module_nr);
+
+    moduleAngle = getModuleAngle(moduleOnRing, ring);
+
+    double plateWidth = getPoreGeom(ring, plate_nr, 'w');
+    int poresOnPlateTest = floor(plateWidth/porePitch);
+    poresOnPlateTest = poresOnPlateTest - ((poresOnPlateTest + 1) & 1);
+
+    if(!use_shell_geometry && poresOnPlateTest != poresPerPlate){
+        printf("Plate dimensions do not fit with instrument file: %d / %d\n", poresPerPlate, poresOnPlateTest);
+        sleep(1);
+        exit(130);
+    }
+    int poresPerHalfPlate = poresPerPlate/2;
+
+    radiusP = getPoreGeom(ring, plate_nr, 'p');
+    radiusM = getPoreGeom(ring, plate_nr, 'm');
+    radiusH = getPoreGeom(ring, plate_nr, 'h');
+
+    int i;
+    for(i = 0; i < poresPerPlate; i++){
+        poreAngle[i] = (porePitch/radiusM)*(i - poresPerHalfPlate) + moduleAngle;
+        poreAngleDegrees[i] = poreAngle[i]/DEGTORAD;
+        poreX[i] = radiusM*cos(poreAngle[i]);
+        poreY[i] = radiusM*sin(poreAngle[i]);
+    }
+
+    thX = poreX[poresPerHalfPlate];
+    thY = poreY[poresPerHalfPlate];
+
+    thZ = -getPoreGeom(ring, plate_nr, 'l');
+
+    srcW = plateWidth*1.05;
+    srcH = srcW;
+
+    coating = malloc(100);
+    coatingSide = malloc(100);
+    coatingBottom = malloc(100);
+
+    if(energy >= 1 && energy <= 10){
+        sprintf(coating, "coatings/B4C80_Ir100_45sigma_%dkeV.dat", energy);
+        sprintf(coatingSide, "coatings/SiO2_10sigma_%dkeV.dat", energy);
+        sprintf(coatingBottom, "%s", coatingSide);
+        printf("Selecting energy %d keV\n", energy);
+    } else {
+        energy = 1; //energy doesn't matter at this point as no coatings are set, this is to avoid e=0
+        coating = "coatings/mirror_coating_unity.txt";
+        coatingSide = coating;
+        coatingBottom = coating;
+        printf("Selecting unity reflectivity\n");
+    }
+    if(absorb_sides){
+        coatingSide = "coatings/mirror_coating_zero.txt";
+    }
+    if(absorb_bottom){
+        coatingBottom = "coatings/mirror_coating_zero";
+    }
+
+    if(use_shell_geometry){
+        poreW = getPoreGeom(ring, plate_nr, 'w') - 2*PLATE_THICKNESS;
+        poreAngle[0] = moduleAngle;
+        poreAngleDegrees[0] = poreAngle[0]/DEGTORAD;
+    }
+%}
+
+
+/* Here comes the TRACE section, where the actual      */
+/* instrument is defined as a sequence of components.  */
+TRACE
+
+COMPONENT origin = Progress_bar()
+AT (0,0,0) ABSOLUTE
+EXTEND
+%{
+    photonCount++;
+    enteredPore = 0;
+    bufferAddNewPhoton();
+%}
+
+COMPONENT ThetaArm = Arm()
+AT (thX, thY, thZ) ABSOLUTE
+ROTATED (0, source_th/60.0, 0) ABSOLUTE
+
+COMPONENT srcDirectional = Source_div(
+E0=energy,
+dE=dEnergy,
+xwidth=srcW,
+yheight=srcH,
+focus_aw=source_dx/60*DEGTORAD,
+focus_ah=source_dy/60*DEGTORAD,
+gauss=0)
+WHEN(source_type == 0)
+AT(0, 0, -sourceToOptics) RELATIVE ThetaArm
+ROTATED (0, 0, 0) RELATIVE ThetaArm
+
+COMPONENT srcDirectionalWide = Source_div(
+E0=energy,
+dE=dEnergy,
+xwidth=3*srcW,
+yheight=3*srcH,
+focus_aw=source_dx/60*DEGTORAD,
+focus_ah=source_dy/60*DEGTORAD,
+gauss=0)
+WHEN(source_type == 1)
+AT(0, 0, -sourceToOptics) RELATIVE ThetaArm
+ROTATED (0, 0, 0) RELATIVE ThetaArm
+
+//==============================================================================
+//BEGIN PROCEDURAL PART
+//==============================================================================
+COMPONENT PoreArm0 = Arm()
+AT (0, 0, 0) ABSOLUTE
+ROTATED (0, 0, poreAngleDegrees[0]-90) ABSOLUTE
+
+
+
+COMPONENT PoreP0 = Pore_p_group(
+radius_p = radiusP,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm0
+ROTATED (0, 0, 0) RELATIVE PoreArm0
+GROUP parabolic EXTEND
+%{
+if(!enteredPore){
+bufferRemoveCurrentPhoton();
+ABSORB;}
+%}
+
+COMPONENT PoreH0 = Pore_h_group(
+radius_h = radiusH,
+radius_m = radiusM,
+Z0 = FOCALLENGTH,
+xwidth = poreW,
+yheight = poreH,
+mirror_reflec = coating,
+bottom_reflec = coatingSide,
+side_reflec = coatingSide,
+absorb_sides = 0)
+AT(0, radiusM, 0) RELATIVE PoreArm0
+ROTATED (0, 0, 0) RELATIVE PoreArm0
+GROUP hyperbolic//==============================================================================
+// END OF PROCEDURAL PART
+//==============================================================================
+
+COMPONENT monitorAfter = PSD_monitor_ext(
+    //filename = "afterMonitor.dat",
+    restore_xray=1,
+    xwidth=wideSize,
+    yheight=wideSize,
+    nx = wideResolution, ny = wideResolution)
+    AT (0, 0, 0.15) ABSOLUTE
+    EXTEND
+    %{
+        photonPassedThrough++;
+        photonPassedThroughWeighted += p;
+        bufferAddPlanePosition(EXITP, posx, posy, 0.15);
+        bufferAddPhotonInfo(p);
+    %}
+
+// COMPONENT endMonitor = PSD_monitor(
+//     //filename = "endMonitor.dat",
+//     restore_xray=1,
+//     xwidth=detectorSize,
+//     yheight=detectorSize,
+//     nx = finalResolution, ny = finalResolution)
+//     AT (0, 0, focalLength) ABSOLUTE
+//     EXTEND
+//     %{
+//         bufferAdd
+//     %}
+
+COMPONENT endMonitorWide = PSD_monitor_ext(
+    //filename = "endMonitorWide.dat",
+    restore_xray=0,
+    xwidth=wideSize,
+    yheight=wideSize,
+    nx = wideResolution, ny = wideResolution)
+    AT (0, 0, focalLength) ABSOLUTE
+    EXTEND
+    %{
+        bufferAddAbsorb(FOCALPLANE, posx, posy, focalLength);
+    %}
+
+/* This section is executed when the simulation ends (C code). Other    */
+/* optional sections are : SAVE                                         */
+FINALLY
+%{
+    photonCount++;
+
+    double sourceFlux = photonCount/srcW/srcH;
+
+    bufferAddRunInfo(photonCount, photonPassedThrough, photonPassedThroughWeighted, sourceFlux, radiusM);
+    bufferEndOfRun();
+
+    char fn[256];
+    sprintf(fn, "%s.dat", output_filename);
+
+    FILE *fp = fopen(fn, "a");
+    // showBufferHead();
+    bufferWriteAndReset(fp);
+    fflush(fp);
+    fclose(fp);
+%}
+
+/* The END token marks the instrument definition end */
+END

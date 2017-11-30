@@ -2,7 +2,7 @@
  * Format:     ANSI C source code
  * Creator:    McXtrace <http://www.mcxtrace.org>
  * Instrument: instruments/plate37.instr (AthenaModule)
- * Date:       Thu Nov  9 14:34:40 2017
+ * Date:       Thu Nov 16 14:36:24 2017
  * File:       instruments/plate37.c
  * Compile:    cc -o AthenaModule.out instruments/plate37.c 
  * CFLAGS=
@@ -6779,8 +6779,8 @@ struct mcinputtable_struct mcinputtable[mcNUMIPAR+1] = {
   "source_th", &mcipsource_th, instr_type_double, "0", 
   "source_dx", &mcipsource_dx, instr_type_double, "0", 
   "source_dy", &mcipsource_dy, instr_type_double, "0", 
-  "absorb_sides", &mcipabsorb_sides, instr_type_int, "1", 
-  "absorb_bottom", &mcipabsorb_bottom, instr_type_int, "1", 
+  "absorb_sides", &mcipabsorb_sides, instr_type_int, "0", 
+  "absorb_bottom", &mcipabsorb_bottom, instr_type_int, "0", 
   "output_filename", &mcipoutput_filename, instr_type_string, "", 
   NULL, NULL, instr_type_double, ""
 };
@@ -14449,8 +14449,8 @@ poresPerPlate = 37;
 
     if(energy >= 1 && energy <= 10){
         sprintf(coating, "coatings/B4C80_Ir100_45sigma_%dkeV.dat", energy);
-        sprintf(coatingSide, "%s", coating);
-        sprintf(coatingBottom, "%s", coating);
+        sprintf(coatingSide, "coatings/SiO2_10sigma_%dkeV.dat", energy);
+        sprintf(coatingBottom, "%s", coatingSide);
         printf("Selecting energy %d keV\n", energy);
     } else {
         energy = 1; //energy doesn't matter at this point as no coatings are set, this is to avoid e=0

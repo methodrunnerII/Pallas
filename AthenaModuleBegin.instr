@@ -34,6 +34,7 @@ DEFINE INSTRUMENT AthenaModule(
     double source_dy = 0,
     int absorb_sides = 0,
     int absorb_bottom = 0,
+    int use_shell_geometry = 0,
     char* output_filename = "")
 
 /* The DECLARE section allows us to declare variables or  small      */

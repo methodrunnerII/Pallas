@@ -32,8 +32,8 @@ DEFINE INSTRUMENT AthenaModule(
     double source_th = 0,
     double source_dx = 0,
     double source_dy = 0,
-    int absorb_sides = 1,
-    int absorb_bottom = 1,
+    int absorb_sides = 0,
+    int absorb_bottom = 0,
     char* output_filename = "")
 
 /* The DECLARE section allows us to declare variables or  small      */
@@ -171,8 +171,8 @@ poresPerPlate = 49;
 
     if(energy >= 1 && energy <= 10){
         sprintf(coating, "coatings/B4C80_Ir100_45sigma_%dkeV.dat", energy);
-        sprintf(coatingSide, "%s", coating);
-        sprintf(coatingBottom, "%s", coating);
+        sprintf(coatingSide, "coatings/SiO2_10sigma_%dkeV.dat", energy);
+        sprintf(coatingBottom, "%s", coatingSide);
         printf("Selecting energy %d keV\n", energy);
     } else {
         energy = 1; //energy doesn't matter at this point as no coatings are set, this is to avoid e=0
