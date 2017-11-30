@@ -62,9 +62,6 @@ def getRing(m):
 
 def runModule(i):
     ring = getRing(i)
-    plateWidth = float(geom[ring*68][4])
-    plateWidthPores = int(plateWidth/poreWidth);
-    plateWidthPores = plateWidthPores - ((plateWidthPores+1) % 2)
 
     fn = '%s/%dam_%dkeV_mod%d' % (outputPath, a, e, i);
     print(outputPath);
